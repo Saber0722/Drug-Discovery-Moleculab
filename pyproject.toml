@@ -1,0 +1,65 @@
+[project]
+name = "MOLECULAB"
+version = "0.1.0"
+description = "MolecuLab — open in silico drug screening workbench"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # Core API
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "python-multipart>=0.0.9",
+    "aiofiles>=23.2.1",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.3.0",
+    # Database / task queue
+    "sqlalchemy>=2.0.30",
+    "alembic>=1.13.0",
+    "celery[redis]>=5.4.0",
+    "redis>=5.0.4",
+    # Cheminformatics (Phase 1 — CPU only)
+    "rdkit>=2024.3.1",
+    "deepchem>=2.8.0",
+    # Reporting
+    "reportlab>=4.2.0",
+    "pillow>=10.3.0",
+    # Utilities
+    "httpx>=0.27.0",
+    "loguru>=0.7.2",
+    "python-dotenv>=1.0.1",
+    "aiosqlite>=0.22.1",
+]
+
+[project.optional-dependencies]
+docking = [
+    # Install AutoDock-Vina separately: https://github.com/ccsb-scripps/AutoDock-Vina
+    "vina>=1.2.5",
+    "py3dmol>=2.1.0",
+]
+protein = [
+    # ESMFold fallback via API (no local GPU needed for Phase 1)
+    "requests>=2.32.0",
+]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.7",
+    "httpx>=0.27.0",
+    "ruff>=0.4.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend/app"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.7",
+    "ruff>=0.4.0",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
