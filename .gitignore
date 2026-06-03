@@ -12,3 +12,7 @@ wheels/
 drug_discovery_build_plan.html
 
 .env
+
+frontend/node_modules
+
+pdb_files

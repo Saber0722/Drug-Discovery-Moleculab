@@ -1,0 +1,6 @@
+redis-server &                   # start Redis
+uv run celery -A app.tasks.celery_tasks worker --loglevel=info &
+uv run uvicorn backend.main:app --reload --port 8000
+
+# Frontend (separate terminal)
+cd frontend && npm run dev

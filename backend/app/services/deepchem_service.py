@@ -1,17 +1,18 @@
 """
-DeepChem toxicity (Tox21) and ADMET prediction service.
+DeepChem toxicity (Tox21) prediction service.
 
-Models used:
-  - Tox21:    AttentiveFP pretrained on Tox21 dataset (12 endpoints)
-  - ClinTox:  AttentiveFP pretrained on ClinTox dataset (FDA binary)
-  - ADMET:    ADMETlab 2.0 free API as fallback when DeepChem unavailable
+Phase 1: Uses RDKit structural-alert heuristic — always returns a value.
+Phase 2: Drop a trained MultitaskClassifier checkpoint into
+         data/models/tox21_attentivefp/ and it will be picked up automatically.
 
-All predictions are computational only — for research purposes.
+To train the checkpoint (Phase 2), run:
+    python backend/app/scripts/train_tox21.py
 """
 
 from __future__ import annotations
 from dataclasses import dataclass, field
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -21,15 +22,17 @@ try:
     DEEPCHEM_AVAILABLE = True
 except ImportError:
     DEEPCHEM_AVAILABLE = False
-    logger.warning("DeepChem not installed; toxicity predictions will be unavailable.")
+    logger.warning("DeepChem not installed; using RDKit heuristic for toxicity.")
 
-
-# Tox21 endpoint labels (12 assays)
 TOX21_ENDPOINTS = [
     "NR-AR", "NR-AR-LBD", "NR-AhR", "NR-Aromatase",
     "NR-ER", "NR-ER-LBD", "NR-PPAR-gamma",
     "SR-ARE", "SR-ATAD5", "SR-HSE", "SR-MMP", "SR-p53",
 ]
+
+CHECKPOINT_DIR = os.path.join(
+    os.path.dirname(__file__), "..", "data", "models", "tox21_attentivefp"
+)
 
 
 @dataclass
@@ -53,113 +56,123 @@ class AdmetResult:
     error: str | None = None
 
 
-# ── DeepChem model loader (lazy, cached) ─────────────────────────────────────
+# ── RDKit heuristic (Phase 1 default) ────────────────────────────────────────
 
-_tox21_model: "dc.models.AttentiveFPModel | None" = None
-_clintox_model: "dc.models.AttentiveFPModel | None" = None
+def _rdkit_tox_heuristic(smiles: str) -> ToxicityResult:
+    """
+    Structural-alert heuristic using RDKit descriptors.
+    Clearly labelled in result.error. Guarantees overall_tox_score is never None.
+    """
+    result = ToxicityResult()
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import Descriptors, rdMolDescriptors
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            result.overall_tox_score = 0.5
+            result.error = "Invalid SMILES"
+            return result
+
+        mw    = Descriptors.MolWt(mol)
+        logp  = Descriptors.MolLogP(mol)
+        hbd   = rdMolDescriptors.CalcNumHBD(mol)
+        rings = rdMolDescriptors.CalcNumRings(mol)
+        arom  = rdMolDescriptors.CalcNumAromaticRings(mol)
+
+        score = min(1.0, max(0.0,
+            0.30 * min(logp  / 6.0, 1.0) +
+            0.20 * min(mw    / 600.0, 1.0) +
+            0.20 * min(arom  / 4.0, 1.0) +
+            0.15 * min(rings / 5.0, 1.0) +
+            0.15 * min(hbd   / 5.0, 1.0)
+        ))
+        result.tox21_scores = {ep: round(score, 4) for ep in TOX21_ENDPOINTS}
+        result.overall_tox_score = round(score, 4)
+        result.error = "heuristic: structural alert estimate — train model for real predictions"
+    except Exception as e:
+        result.overall_tox_score = 0.5
+        result.error = f"Heuristic failed: {e}"
+    return result
+
+
+# ── DeepChem model loader (Phase 2, lazy + cached) ───────────────────────────
+
+_tox21_model = None
+_tox21_tasks = None
+
+
+def _checkpoint_exists() -> bool:
+    """True only if a real checkpoint is present (has .index file)."""
+    if not os.path.isdir(CHECKPOINT_DIR):
+        return False
+    return any(f.endswith(".index") for f in os.listdir(CHECKPOINT_DIR))
 
 
 def _load_tox21():
-    global _tox21_model
-    if _tox21_model is None and DEEPCHEM_AVAILABLE:
-        try:
-            tasks, datasets, transformers = dc.molnet.load_tox21(
-                featurizer="AttentiveFP", splitter=None
-            )
-            _tox21_model = dc.models.AttentiveFPModel(
-                n_tasks=len(tasks), mode="classification", batch_size=16
-            )
-            # NOTE: In production, load pretrained weights from data/models/
-            # _tox21_model.load_checkpoint("data/models/tox21_attentivefp/")
-        except Exception as e:
-            logger.error(f"Failed to load Tox21 model: {e}")
-    return _tox21_model
-
-
-def _load_clintox():
-    global _clintox_model
-    if _clintox_model is None and DEEPCHEM_AVAILABLE:
-        try:
-            tasks, datasets, transformers = dc.molnet.load_clintox(
-                featurizer="AttentiveFP", splitter=None
-            )
-            _clintox_model = dc.models.AttentiveFPModel(
-                n_tasks=len(tasks), mode="classification", batch_size=16
-            )
-        except Exception as e:
-            logger.error(f"Failed to load ClinTox model: {e}")
-    return _clintox_model
+    global _tox21_model, _tox21_tasks
+    if _tox21_model is not None:
+        return _tox21_model, _tox21_tasks
+    if not DEEPCHEM_AVAILABLE or not _checkpoint_exists():
+        return None, None
+    try:
+        tasks, datasets, _ = dc.molnet.load_tox21(featurizer="ECFP", splitter=None)
+        _tox21_tasks = tasks
+        model = dc.models.MultitaskClassifier(
+            n_tasks=len(tasks),
+            n_features=1024,
+            layer_sizes=[512, 256],
+            dropouts=0.25,
+            batch_size=16,
+            model_dir=CHECKPOINT_DIR,
+        )
+        model.restore()
+        logger.info("Loaded Tox21 checkpoint from %s", CHECKPOINT_DIR)
+        _tox21_model = model
+        return _tox21_model, _tox21_tasks
+    except Exception as e:
+        logger.error("Failed to load Tox21 checkpoint: %s", e)
+        return None, None
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def predict_toxicity(smiles: str) -> ToxicityResult:
-    """Run Tox21 + ClinTox predictions for a SMILES string."""
+    """
+    Tox21 prediction. Uses trained DeepChem model if checkpoint exists,
+    otherwise RDKit heuristic. Always returns a non-None overall_tox_score.
+    """
+    model, tasks = _load_tox21()
+    if model is None:
+        return _rdkit_tox_heuristic(smiles)
+
     result = ToxicityResult()
-
-    if not DEEPCHEM_AVAILABLE:
-        result.error = "DeepChem not installed"
-        return result
-
     try:
-        import numpy as np
-        featurizer = dc.feat.MolGraphConvFeaturizer(use_edges=True)
+        featurizer = dc.feat.CircularFingerprint(size=1024)
         feat = featurizer.featurize([smiles])
-        if feat[0] is None:
-            result.error = "Could not featurize molecule"
-            return result
-
         dataset = dc.data.NumpyDataset(X=feat)
+        preds = model.predict(dataset)          # (1, n_tasks, 2) or (1, n_tasks)
 
-        # Tox21
-        model = _load_tox21()
-        if model:
-            preds = model.predict(dataset)  # shape: (1, 12, 2)
-            toxic_probs = preds[0, :, 1]    # probability of toxic class
-            result.tox21_scores = {
-                ep: round(float(p), 4)
-                for ep, p in zip(TOX21_ENDPOINTS, toxic_probs)
-            }
-            result.overall_tox_score = round(float(np.mean(toxic_probs)), 4)
-
-        # ClinTox
-        ct_model = _load_clintox()
-        if ct_model:
-            ct_preds = ct_model.predict(dataset)
-            result.clintox_fda_approved = round(float(ct_preds[0, 0, 1]), 4)
-            result.clintox_clinical_risk = round(float(ct_preds[0, 1, 1]), 4)
-
+        toxic_probs = preds[0, :, 1] if preds.ndim == 3 else preds[0, :]
+        result.tox21_scores = {
+            ep: round(float(p), 4)
+            for ep, p in zip(TOX21_ENDPOINTS, toxic_probs)
+        }
+        result.overall_tox_score = round(float(np.mean(toxic_probs)), 4)
     except Exception as e:
-        result.error = str(e)
-        logger.error(f"Toxicity prediction failed for {smiles}: {e}")
-
+        logger.error("DeepChem prediction failed for %s: %s", smiles[:30], e)
+        fallback = _rdkit_tox_heuristic(smiles)
+        result.overall_tox_score = fallback.overall_tox_score
+        result.tox21_scores      = fallback.tox21_scores
+        result.error             = str(e)
     return result
 
 
 def predict_admet(smiles: str) -> AdmetResult:
-    """
-    ADMET prediction via DeepChem (BBB, CYP450, hERG, oral BA, half-life).
-    Falls back to ADMETlab 2.0 API if DeepChem model unavailable.
-    """
-    result = AdmetResult()
-
-    if not DEEPCHEM_AVAILABLE:
-        return _admetlab_fallback(smiles)
-
-    try:
-        # DeepChem ADMET suite — uses pretrained checkpoints in data/models/
-        # For Phase 1, we return placeholder values; wire up checkpoints in Phase 2
-        logger.info(f"ADMET prediction requested for {smiles[:20]}…")
-        result.source = "deepchem_stub"
-        result.error = "Load pretrained ADMET checkpoints in data/models/ to activate"
-    except Exception as e:
-        result.error = str(e)
-
-    return result
+    """ADMET via ADMETlab 2.0 free API."""
+    return _admetlab_fallback(smiles)
 
 
 def _admetlab_fallback(smiles: str) -> AdmetResult:
-    """Call ADMETlab 2.0 free API as fallback."""
     import httpx
     result = AdmetResult(source="admetlab_api")
     try:
@@ -170,11 +183,10 @@ def _admetlab_fallback(smiles: str) -> AdmetResult:
         )
         resp.raise_for_status()
         data = resp.json()
-        # Parse ADMETlab response fields
-        result.bbb_permeability = data.get("BBB")
+        result.bbb_permeability     = data.get("BBB")
         result.oral_bioavailability = data.get("F30")
-        result.half_life_hours = data.get("HL")
-        result.herg_toxicity = data.get("hERG")
+        result.half_life_hours      = data.get("HL")
+        result.herg_toxicity        = data.get("hERG")
     except Exception as e:
         result.error = f"ADMETlab API error: {e}"
     return result

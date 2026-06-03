@@ -15,11 +15,18 @@ async function request(path, options = {}) {
 }
 
 export const api = {
-  /** Validate single SMILES + compute RDKit properties */
+  /** Validate single SMILES + compute RDKit properties only (fast) */
   validateMolecule: (smiles, name) =>
     request("/api/molecules/validate", {
       method: "POST",
       body: JSON.stringify({ smiles, name }),
+    }),
+
+  /** Full synchronous single-molecule pipeline: RDKit + Tox21 + Vina (slow, ~60s) */
+  screenMolecule: (smiles, target = "ACE2", name) =>
+    request("/api/molecules/screen", {
+      method: "POST",
+      body: JSON.stringify({ smiles, target, name }),
     }),
 
   /** Launch async batch screening run */

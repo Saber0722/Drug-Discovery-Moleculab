@@ -137,6 +137,7 @@ function AIPanel({ result }) {
   );
 }
 
+
 function ResultCard({ result, index }) {
   const [expanded, setExpanded] = useState(false);
   const verdict = result.verdict ?? "INVALID";
@@ -169,40 +170,43 @@ function ResultCard({ result, index }) {
       </div>
 
       {expanded && !result.error && (
-        <>
-          <div className="mt-4 grid grid-cols-2 gap-4">
-            {/* Properties table */}
-            <div>
-              <table className="w-full text-xs">
-                <tbody>
-                  {[
-                    ["MW (Da)", result.mol_weight],
-                    ["LogP", result.logp],
-                    ["HBD / HBA", `${result.hbd} / ${result.hba}`],
-                    ["TPSA", result.tpsa],
-                    ["QED", result.qed],
-                    ["Binding (kcal/mol)", result.binding_affinity],
-                    ["Tox overall", result.tox_overall?.toFixed(3)],
-                  ].map(([k, v]) => (
-                    <tr key={k} className="border-b border-slate-700/50">
-                      <td className="py-1 text-slate-400 pr-3">{k}</td>
-                      <td className="py-1 text-slate-200 text-right">{v ?? "—"}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              {result.lipinski_violations?.length > 0 && (
-                <div className="mt-2 text-xs text-yellow-300">
-                  ⚠ Violations: {result.lipinski_violations.join(", ")}
-                </div>
-              )}
-            </div>
-            {/* Radar chart */}
-            <ScoreRadar result={result} />
+  <>
+    <div className="mt-4 grid grid-cols-2 gap-4">
+      {/* Properties table */}
+      <div>
+        <table className="w-full text-xs">
+          <tbody>
+            {[
+              ["MW (Da)", result.mol_weight],
+              ["LogP", result.logp],
+              ["HBD / HBA", `${result.hbd} / ${result.hba}`],
+              ["TPSA", result.tpsa],
+              ["QED", result.qed],
+              ["Binding (kcal/mol)", result.binding_affinity],
+              ["Tox overall", result.tox_overall?.toFixed(3)],
+            ].map(([k, v]) => (
+              <tr key={k} className="border-b border-slate-700/50">
+                <td className="py-1 text-slate-400 pr-3">{k}</td>
+                <td className="py-1 text-slate-200 text-right">{v ?? "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+
+        {result.lipinski_violations?.length > 0 && (
+          <div className="mt-2 text-xs text-yellow-300">
+            ⚠ Violations: {result.lipinski_violations.join(", ")}
           </div>
-          <AIPanel result={result} />
-        </>
-      )}
+        )}
+      </div>
+
+      {/* Radar chart */}
+      <ScoreRadar result={result} />
+    </div>
+
+    <AIPanel result={result} />
+  </>
+)}
     </div>
   );
 }
@@ -235,10 +239,25 @@ export default function Screener() {
     if (!lines.length) return;
     setStatus("running");
     setError(null);
+    setResults([]);
+
+    if (mode === "single") {
+      // Use fast synchronous endpoint — no Celery needed
+      try {
+        const data = await api.screenMolecule(lines[0], target);
+        setResults([data]);
+        setStatus("done");
+      } catch (e) {
+        setError(e.message);
+        setStatus("error");
+      }
+      return;
+    }
+
+    // Batch — use Celery queue
     try {
       const run = await api.startScreening(lines, target);
       setRunId(run.run_id);
-      // Poll for completion
       const poll = setInterval(async () => {
         const statusData = await api.getRunStatus(run.run_id);
         if (statusData.status === "completed") {
@@ -255,7 +274,7 @@ export default function Screener() {
       setError(e.message);
       setStatus("error");
     }
-  }, [smiles, target]);
+  }, [smiles, target, mode]);
 
   const handleExport = useCallback(async () => {
     try {
@@ -367,7 +386,9 @@ export default function Screener() {
         )}
         {status === "running" && (
           <p className="text-xs text-cyan-400 animate-pulse">
-            Pipeline running: RDKit → Tox21 → ADMET → AutoDock Vina…
+            {mode === "single"
+              ? "⏳ Running pipeline: RDKit → Tox21 → AutoDock Vina (30–120s)…"
+              : "⏳ Batch queued via Celery — polling for results…"}
           </p>
         )}
       </div>

@@ -1,16 +1,18 @@
 """
 AutoDock Vina docking service.
 
-Wraps the `vina` Python bindings. The receptor .pdb files for common
-drug targets (ACE2, EGFR, etc.) are pre-downloaded in data/proteins/.
-
-Binding energy threshold from spec: < -7 kcal/mol = strong binder.
+Box coordinates computed from actual binding site residues:
+- ACE2  (1R42): zinc peptidase active site (His374, His378, Glu402, His540)
+- EGFR  (1M17): ATP binding pocket (Thr766, Met769, Lys745, Thr790)
+- CDK2  (1HCL): ATP/inhibitor binding site (Leu83, His84, Gln85, Asp145)
+- BRAF  (1UWH): kinase domain DFG pocket (Cys532, Asp594, Phe595)
 """
 
 from __future__ import annotations
 import os
+import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import logging
 
@@ -21,7 +23,7 @@ try:
     VINA_AVAILABLE = True
 except ImportError:
     VINA_AVAILABLE = False
-    logger.warning("AutoDock Vina not installed. Docking will be unavailable.")
+    logger.warning("AutoDock Vina not installed — run: uv add vina meeko")
 
 try:
     from rdkit import Chem
@@ -30,105 +32,108 @@ try:
 except ImportError:
     RDKIT_AVAILABLE = False
 
-# Default search box centres for common targets (x, y, z, size_x, size_y, size_z)
-TARGET_BOXES: dict[str, tuple[float, float, float, float, float, float]] = {
-    "ACE2":  (  -9.2,  10.5,  54.3, 25, 25, 25),
-    "EGFR":  ( -44.0,  21.3,  32.1, 20, 20, 20),
-    "CDK2":  (  22.0,  -1.5,  43.7, 20, 20, 20),
-    "BRAF":  ( -11.3,  15.2,  40.5, 22, 22, 22),
-    "custom": (0.0, 0.0, 0.0, 25, 25, 25),  # user-supplied box
+# Box centres + sizes (Å) — derived from actual binding site residue coordinates
+TARGET_BOXES: dict[str, dict] = {
+    "ACE2": dict(center=[46.2, 71.7, 34.2], size=[25, 25, 25]),
+    "EGFR": dict(center=[24.8,  8.6, 60.5], size=[22, 22, 22]),
+    "CDK2": dict(center=[104.2, 100.4, 78.0], size=[22, 22, 22]),
+    "BRAF": dict(center=[83.8, 35.3, 66.8], size=[22, 22, 22]),
 }
 
-DATA_DIR = Path(__file__).parent.parent / "data" / "proteins"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "proteins"
 
 
 @dataclass
 class DockingResult:
     target: str
-    best_affinity: float | None = None   # kcal/mol
-    pose_energies: list[float] | None = None
-    pdb_pose: str | None = None           # best pose as PDB string
-    verdict: str | None = None            # "strong" | "moderate" | "weak"
+    best_affinity: float | None = None
+    pose_energies: list[float] = field(default_factory=list)
+    pdb_pose: str | None = None
+    verdict: str | None = None   # strong | moderate | weak
     error: str | None = None
 
 
-def smiles_to_pdbqt(smiles: str) -> str | None:
-    """Convert SMILES → 3D SDF → PDBQT using RDKit + meeko (if available)."""
+def _smiles_to_pdbqt_string(smiles: str) -> str | None:
+    """SMILES → 3D conformer → PDBQT string via meeko."""
     if not RDKIT_AVAILABLE:
         return None
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
     mol = Chem.AddHs(mol)
-    result = AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
-    if result == -1:
+    if AllChem.EmbedMolecule(mol, AllChem.ETKDGv3()) == -1:
         return None
     AllChem.MMFFOptimizeMolecule(mol)
 
     try:
-        from meeko import MoleculePreparation
+        from meeko import MoleculePreparation, PDBQTWriterLegacy
         preparator = MoleculePreparation()
-        preparator.prepare(mol)
-        return preparator.write_pdbqt_string()
-    except ImportError:
-        # Fallback: write SDF and let vina handle it (less ideal)
+        mol_setups = preparator.prepare(mol)
+        pdbqt_string, is_ok, error_msg = PDBQTWriterLegacy.write_string(mol_setups[0])
+        if not is_ok:
+            logger.error(f"meeko write failed: {error_msg}")
+            return None
+        return pdbqt_string
+    except Exception as e:
+        logger.warning(f"meeko failed ({e}), trying obabel fallback")
+        # obabel fallback
         with tempfile.NamedTemporaryFile(suffix=".sdf", delete=False, mode="w") as f:
-            writer = Chem.SDWriter(f.name)
-            writer.write(mol)
-            writer.close()
-            return f.name  # caller must handle SDF path vs PDBQT string
+            sdf_path = f.name
+        writer = Chem.SDWriter(sdf_path)
+        writer.write(mol)
+        writer.close()
+        pdbqt_path = sdf_path.replace(".sdf", ".pdbqt")
+        try:
+            subprocess.run(
+                ["obabel", sdf_path, "-O", pdbqt_path, "--partialcharge", "gasteiger"],
+                capture_output=True, check=True
+            )
+            return Path(pdbqt_path).read_text()
+        except Exception as e2:
+            logger.error(f"obabel fallback failed: {e2}")
+            return None
+        finally:
+            os.unlink(sdf_path)
+            if os.path.exists(pdbqt_path):
+                os.unlink(pdbqt_path)
 
 
 def dock_molecule(smiles: str, target: str = "ACE2") -> DockingResult:
-    """
-    Run AutoDock Vina docking for a SMILES against a pre-prepared receptor.
-
-    Returns DockingResult with binding energy (kcal/mol) and PDB pose.
-    """
+    """Run AutoDock Vina docking. Returns DockingResult (error field set if unavailable)."""
     result = DockingResult(target=target)
 
     if not VINA_AVAILABLE:
-        result.error = "AutoDock Vina not installed (pip install vina)"
+        result.error = "AutoDock Vina not installed — run: uv add vina meeko"
         return result
 
     receptor_path = DATA_DIR / f"{target}.pdbqt"
     if not receptor_path.exists():
-        result.error = (
-            f"Receptor file not found: {receptor_path}. "
-            "Download from RCSB PDB and prepare with prepare_receptor4.py."
-        )
+        result.error = f"Receptor not found: {receptor_path}"
         return result
 
     if target not in TARGET_BOXES:
-        result.error = f"Unknown target '{target}'. Add box coords to TARGET_BOXES."
+        result.error = f"No box config for target '{target}'"
         return result
 
-    cx, cy, cz, sx, sy, sz = TARGET_BOXES[target]
-
-    ligand_pdbqt = smiles_to_pdbqt(smiles)
-    if ligand_pdbqt is None:
-        result.error = "Failed to generate 3D conformer from SMILES"
+    ligand_pdbqt = _smiles_to_pdbqt_string(smiles)
+    if not ligand_pdbqt:
+        result.error = "Failed to generate ligand PDBQT (check meeko/obabel install)"
         return result
 
     try:
         v = Vina(sf_name="vina", verbosity=0)
         v.set_receptor(str(receptor_path))
+        v.set_ligand_from_string(ligand_pdbqt)
 
-        if ligand_pdbqt.endswith(".sdf"):
-            v.set_ligand_from_file(ligand_pdbqt)
-            os.unlink(ligand_pdbqt)
-        else:
-            v.set_ligand_from_string(ligand_pdbqt)
-
-        v.compute_vina_maps(center=[cx, cy, cz], box_size=[sx, sy, sz])
+        box = TARGET_BOXES[target]
+        v.compute_vina_maps(center=box["center"], box_size=box["size"])
         v.dock(exhaustiveness=8, n_poses=5)
 
         energies = v.energies(n_poses=5)
-        result.pose_energies = [round(e[0], 3) for e in energies]
+        result.pose_energies = [round(float(e[0]), 3) for e in energies]
         result.best_affinity = result.pose_energies[0]
         result.pdb_pose = v.poses(n_poses=1, energy_range=3)
 
-        # Verdict from spec
         if result.best_affinity <= -7.0:
             result.verdict = "strong"
         elif result.best_affinity <= -5.0:
@@ -138,6 +143,6 @@ def dock_molecule(smiles: str, target: str = "ACE2") -> DockingResult:
 
     except Exception as e:
         result.error = str(e)
-        logger.error(f"Docking failed for {smiles[:20]}: {e}")
+        logger.error(f"Docking failed for {smiles[:30]}: {e}")
 
     return result
